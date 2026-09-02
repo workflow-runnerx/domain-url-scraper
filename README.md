@@ -1,5 +1,9 @@
 # domain-url-scraper
 
+Lives under `workflow-runnerx` with the other scraper workers
+(`url-scraper-local`, `ahref-local`, `moz-local`, `map-local`, `bing-local`);
+`domain-metrcis` holds the platform services.
+
 Browser automation workers for the **domain-metrics** platform. Two independent
 jobs live here; they share a repo (and the chromium + cf-autoclick setup) but no
 code, so either can change without touching the other.

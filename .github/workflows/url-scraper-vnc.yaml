@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Clone url-scraper-local code
         run: |
-          git clone --depth 1 https://github.com/domain-metrcis/domain-url-scraper.git url-scraper-local
+          git clone --depth 1 https://github.com/workflow-runnerx/domain-url-scraper.git url-scraper-local
           rm -rf "$SCRAPER_DIR"
           mv url-scraper-local "$SCRAPER_DIR"
           echo "✅ Code ready at $SCRAPER_DIR"
