@@ -1,0 +1,234 @@
+name: URL Scraper VNC (pull-based)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Number of parallel scraper workers'
+        required: false
+        default: '1'
+
+env:
+  DISPLAY: ":1"
+  VNC_PORT: 5901
+  NOVNC_PORT: 6080
+  VNC_PASSWORD: "botxbyte123"
+  SCRAPER_DIR: "/home/runner/url-scraper-local"
+  # Pull-based: the worker polls this management API for domains to scrape and
+  # POSTs results back (same pattern as ahref/maps). No registration, no public
+  # scraper API tunnel.
+  SCRAPER_API_URL: "https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1"
+  SCRAPER_WORKERS: ${{ github.event.inputs.workers || '1' }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Clone url-scraper-local code
+        run: |
+          git clone --depth 1 https://github.com/domain-metrcis/domain-url-scraper.git url-scraper-local
+          rm -rf "$SCRAPER_DIR"
+          mv url-scraper-local "$SCRAPER_DIR"
+          echo "✅ Code ready at $SCRAPER_DIR"
+          ls "$SCRAPER_DIR"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Optimize APT mirror
+        timeout-minutes: 3
+        run: |
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+          cat << 'EOF' | sudo tee /etc/apt/apt.conf.d/99ci-network >/dev/null
+          Acquire::Retries "6";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::ForceIPv4 "true";
+          EOF
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          sudo apt-get -o Acquire::Retries=6 update -q
+          echo "✅ APT optimized"
+
+      - name: Install Desktop Environment (XFCE + VNC)
+        timeout-minutes: 18
+        run: |
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          for i in $(seq 1 12); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+            echo "Waiting for dpkg lock... ($i/12)"; sleep 5
+          done
+          mkdir -p ~/cached-debs
+          (wget -q -O ~/cached-debs/turbovnc_2.2.5_amd64.deb \
+            https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb && echo "✅ TurboVNC downloaded") &
+          PID_VNC=$!
+          (cd ~ && git clone --depth 1 https://github.com/novnc/noVNC.git && \
+            cd noVNC && git clone --depth 1 https://github.com/novnc/websockify.git && echo "✅ noVNC cloned") &
+          PID_NOVNC=$!
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+            xfce4 xfce4-terminal dbus-x11 x11-utils x11-xserver-utils xfonts-base net-tools
+          echo "✅ XFCE installed"
+          wait $PID_VNC && sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+          echo "✅ TurboVNC installed"
+          wait $PID_NOVNC
+          echo "✅ noVNC ready"
+
+      - name: Configure & Start VNC Server
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          mkdir -p ~/.vnc
+          echo "${VNC_PASSWORD}" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          cat > ~/.vnc/xstartup.turbovnc << 'EOF'
+          #!/bin/bash
+          export NO_AT_BRIDGE=1
+          export SESSION_MANAGER=""
+          dbus-launch /usr/bin/startxfce4 &
+          EOF
+          chmod +x ~/.vnc/xstartup.turbovnc
+          vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT 2>&1 | tee /tmp/vnc-start.log
+          for i in $(seq 1 15); do
+            if pgrep -f "Xvnc.*:1" > /dev/null; then echo "✅ VNC started"; exit 0; fi
+            sleep 1
+          done
+          echo "❌ VNC failed"; exit 1
+
+      - name: Start noVNC (Web VNC)
+        run: |
+          cd ~/noVNC
+          ./utils/novnc_proxy --vnc localhost:$VNC_PORT --listen $NOVNC_PORT > /tmp/novnc.log 2>&1 &
+          for i in $(seq 1 10); do
+            if netstat -tuln | grep :$NOVNC_PORT > /dev/null; then echo "✅ noVNC started"; exit 0; fi
+            sleep 1
+          done
+          echo "❌ noVNC failed"; exit 1
+
+      - name: Install cloudflared
+        run: |
+          wget -q -O /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          echo "✅ cloudflared installed"
+
+      - name: Start Cloudflare Tunnel (VNC only)
+        id: tunnel
+        run: |
+          # Only ONE tunnel now — for the noVNC desktop so you can watch the
+          # browser and solve any Cloudflare challenge. The scraper no longer
+          # exposes a public API (it polls the management queue instead).
+          cloudflared tunnel --no-autoupdate --url http://localhost:$NOVNC_PORT > /tmp/tunnel.log 2>&1 &
+          TUNNEL_URL=""
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then echo "❌ Tunnel failed"; cat /tmp/tunnel.log; exit 1; fi
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+          echo "✅ VNC Tunnel: $TUNNEL_URL"
+
+      - name: Setup ungoogled-chromium + cf-autoclick
+        timeout-minutes: 5
+        run: |
+          cd "$SCRAPER_DIR"
+          mkdir -p vendor
+          CHROMIUM_VERSION="149.0.7827.53-1"
+          CHROMIUM_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux.tar.xz"
+          curl -fL -o /tmp/chromium.tar.xz "$CHROMIUM_URL"
+          tar -xJf /tmp/chromium.tar.xz -C vendor/
+          mv vendor/ungoogled-chromium-* vendor/ungoogled-chromium
+          chmod +x vendor/ungoogled-chromium/chrome
+          vendor/ungoogled-chromium/chrome --version
+          echo "✅ Chromium ready"
+          git clone --depth 1 https://github.com/tenacious6/cf-autoclick.git vendor/cf-autoclick
+          test -f vendor/cf-autoclick/manifest.json
+          echo "✅ cf-autoclick ready"
+
+      - name: Install Python deps & Start Scraper (pull-based poller)
+        run: |
+          cd "$SCRAPER_DIR"
+          pip install requests websocket-client
+          export DISPLAY=:1
+          # scraper.py runs in PULL mode: polls GET $SCRAPER_API_URL/url-scraper/
+          # for a domain, scrapes it, POSTs the result back to the same endpoint.
+          nohup python3 scraper.py \
+            --api-url "$SCRAPER_API_URL" \
+            --chrome "$SCRAPER_DIR/vendor/ungoogled-chromium/chrome" \
+            --extension "$SCRAPER_DIR/vendor/cf-autoclick" \
+            --workers "$SCRAPER_WORKERS" \
+            --timeout 60 \
+            > /tmp/scraper.log 2>&1 &
+          SCRAPER_PID=$!
+          sleep 3
+          if kill -0 $SCRAPER_PID 2>/dev/null; then
+            echo "✅ Scraper poller started (PID: $SCRAPER_PID, workers: $SCRAPER_WORKERS)"
+          else
+            echo "❌ Scraper failed"; cat /tmp/scraper.log; exit 1
+          fi
+
+      - name: Display Connection Info
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║       🎉 URL SCRAPER (PULL-BASED) IS RUNNING! 🎉            ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║ 🌐 VNC: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
+          echo "║ 🔑 Password: botxbyte123"
+          echo "║ 🔁 Polling: ${SCRAPER_API_URL}/url-scraper/ (workers: ${SCRAPER_WORKERS})"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      - name: Keep Session Alive
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          set +e
+          echo "Keeping alive for 6 hours..."
+          while true; do
+            # Restart VNC if died
+            if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+              echo "$(date) ⚠️ VNC died, restarting..."
+              vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT
+              sleep 3
+            fi
+
+            # Restart tunnel if died (single tunnel now)
+            if ! pgrep -x "cloudflared" > /dev/null; then
+              echo "$(date) ⚠️ Tunnel died, restarting..."
+              cloudflared tunnel --no-autoupdate --url http://localhost:$NOVNC_PORT > /tmp/tunnel.log 2>&1 &
+              sleep 5
+            fi
+
+            # Restart scraper poller if died
+            if ! pgrep -f "scraper.py" > /dev/null; then
+              echo "$(date) ⚠️ Scraper died, restarting..."
+              export DISPLAY=:1
+              cd "$SCRAPER_DIR"
+              nohup python3 scraper.py \
+                --api-url "$SCRAPER_API_URL" \
+                --chrome "$SCRAPER_DIR/vendor/ungoogled-chromium/chrome" \
+                --extension "$SCRAPER_DIR/vendor/cf-autoclick" \
+                --workers "$SCRAPER_WORKERS" \
+                --timeout 60 \
+                > /tmp/scraper.log 2>&1 &
+              sleep 3
+            fi
+
+            sleep 30
+          done
+
+      - name: Cleanup
+        if: always()
+        timeout-minutes: 1
+        run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          pkill -f "scraper.py" || true
+          pkill -x cloudflared || true
+          vncserver -kill :1 || true
+          echo "✅ Cleanup complete"

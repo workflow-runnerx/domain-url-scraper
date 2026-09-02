@@ -1,0 +1,97 @@
+name: Provider Feeds
+
+# Auction feeds are batch data, not interactive data. They used to be
+# downloaded in-band while a user waited on the campaign-create screen, via the
+# in-cluster browser-service — which Cloudflare blocked, because the cluster
+# egresses from one fixed AWS address it consistently challenges.
+#
+# This runs on a GitHub runner instead: a fresh IP every run (so no residential
+# proxy is needed) with the same ungoogled-chromium + cf-autoclick stack that
+# already clears Cloudflare for the scrapers. The feed is POSTed to
+# domain-metrics and cached, so campaign create reads it instantly and a failed
+# download degrades to a stale feed instead of a 502 in the user's face.
+
+on:
+  schedule:
+    # 02:10 and 14:10 UTC = 07:40 and 19:40 IST. Offset from the hour because
+    # GitHub delays cron heavily on the hour.
+    - cron: '10 2,14 * * *'
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Which feed to fetch'
+        required: false
+        default: 'namejet'
+        type: choice
+        options:
+          - namejet
+
+env:
+  DISPLAY: ':99'
+  # Same build the url-scraper VNC workflow pins, so both stacks behave
+  # identically against Cloudflare.
+  CHROMIUM_VERSION: '149.0.7827.53-1'
+  FEED_PROVIDER: ${{ github.event.inputs.provider || 'namejet' }}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Xvfb + deps
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=6 update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 libgbm1 \
+            libgtk-3-0 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon0 \
+            libpango-1.0-0 libasound2t64 fonts-liberation
+          python3 -m pip install --quiet --upgrade requests websocket-client
+
+      - name: Start virtual display
+        run: |
+          # cf-autoclick is a browser extension, and Chrome refuses to load
+          # extensions in headless mode — so the browser must run headed.
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp &
+          for i in $(seq 1 20); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.5
+          done
+          test -e /tmp/.X11-unix/X99 && echo "✅ Xvfb :99 ready"
+
+      - name: Setup ungoogled-chromium + cf-autoclick
+        timeout-minutes: 6
+        run: |
+          mkdir -p vendor
+          CHROMIUM_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux.tar.xz"
+          curl -fsSL -o /tmp/chromium.tar.xz "$CHROMIUM_URL"
+          tar -xJf /tmp/chromium.tar.xz -C vendor/
+          mv vendor/ungoogled-chromium-* vendor/ungoogled-chromium
+          chmod +x vendor/ungoogled-chromium/chrome
+          vendor/ungoogled-chromium/chrome --version
+
+          git clone --depth 1 https://github.com/tenacious6/cf-autoclick.git vendor/cf-autoclick
+          test -f vendor/cf-autoclick/manifest.json
+          echo "✅ cf-autoclick ready"
+
+      - name: Fetch feed and push to domain-metrics
+        timeout-minutes: 10
+        env:
+          FEED_TOKEN: ${{ secrets.DM_FEED_TOKEN }}
+          FEED_API_URL: https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1
+        run: |
+          python3 feed_fetcher.py \
+            --provider "$FEED_PROVIDER" \
+            --chrome vendor/ungoogled-chromium/chrome \
+            --extension vendor/cf-autoclick
+
+      - name: Report cached feed status
+        if: always()
+        run: |
+          curl -s "https://b-domain.articleinnovator.com/domain-metrics-management-service/api/v1/provider-feed/${FEED_PROVIDER}/status/" \
+            | head -c 600
+          echo

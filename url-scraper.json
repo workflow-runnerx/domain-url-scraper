@@ -1,0 +1,74 @@
+{
+  "url": "about:blank",
+  "variables": {
+    "target_url": "",
+    "selectors_json": "[]"
+  },
+  "options": {
+    "new_tab": true,
+    "close_tab": true,
+    "close_tab_on_error": true
+  },
+  "actions": [
+    {
+      "type": "navigate",
+      "url": "${target_url}"
+    },
+    {
+      "type": "wait_for",
+      "selectors": ["body"],
+      "timeout": 30000
+    },
+    {
+      "type": "delay",
+      "timeout": 5000
+    },
+    {
+      "type": "if_exists",
+      "selectors": [
+        ".cookie-banner", "[class*='cookie']", "[class*='consent']",
+        "[id*='cookie']", "[id*='consent']", "[id*='onetrust']",
+        "[class*='gdpr']", "[class*='cc-']"
+      ],
+      "timeout": 3000,
+      "actions": [
+        {
+          "type": "click",
+          "selectors": [
+            "button[class*='accept']", "button[class*='Accept']",
+            "button[id*='accept']", "[class*='cookie'] button",
+            "[class*='consent'] button", "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+            "text:Accept", "text:Accept All", "text:I agree", "text:Got it", "text:OK"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "delay",
+      "timeout": 2000
+    },
+    {
+      "type": "evaluate",
+      "script": "window.scrollTo(0, document.body.scrollHeight); return 'scrolled'"
+    },
+    {
+      "type": "delay",
+      "timeout": 2000
+    },
+    {
+      "type": "evaluate",
+      "script": "return document.documentElement.outerHTML",
+      "set_variable": "page_html"
+    },
+    {
+      "type": "evaluate",
+      "script": "document.querySelectorAll('figcaption').forEach(function(el){ el.remove(); }); var selectors = ${selectors_json}; var results = []; for (var i = 0; i < selectors.length; i++) { var sel = selectors[i]; var result = { name: sel.name, selector: sel.selector, value: null }; try { if (sel.remove_selector && sel.remove_selector.length > 0) { sel.remove_selector.forEach(function(rs) { document.querySelectorAll(rs).forEach(function(el) { el.remove(); }); }); } if (sel.js_query) { try { result.value = eval(sel.js_query); } catch(e) {} } if (!result.value) { if (sel.is_multiple_value) { var els = document.querySelectorAll(sel.selector); result.value = Array.from(els).map(function(el) { return el.getAttribute('content') || el.getAttribute('href') || el.getAttribute('src') || el.innerText.trim(); }); } else { var el = document.querySelector(sel.selector); if (el) result.value = el.getAttribute('content') || el.getAttribute('href') || el.getAttribute('src') || el.innerText.trim(); } } } catch(e) { result.error = e.message; } results.push(result); } return JSON.stringify(results)",
+      "set_variable": "scraped_data"
+    },
+    {
+      "type": "evaluate",
+      "script": "return JSON.stringify({ title: document.title, url: window.location.href, domain: window.location.hostname })",
+      "set_variable": "page_info"
+    }
+  ]
+}
