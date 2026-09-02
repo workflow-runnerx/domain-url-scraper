@@ -139,9 +139,13 @@ def _dropcatch(kind: str, log=print) -> Iterator[Dict[str, Any]]:
                      params=params, headers=headers, timeout=(20, 120))
     r.raise_for_status()
     payload = r.json()
-    file_url = payload.get("result") or payload.get("Result") or payload.get("url")
-    if not file_url:
-        raise RuntimeError(f"dropcatch: no file url in response: {str(payload)[:200]}")
+    # The URL is nested: {"result": {"fileUrl": ..., "fileName": ...}}.
+    result = payload.get("result") or payload.get("Result") or {}
+    file_url = result.get("fileUrl") if isinstance(result, dict) else None
+    if not isinstance(file_url, str) or not file_url:
+        raise RuntimeError(
+            f"dropcatch: no fileUrl in response: {str(payload)[:200]}"
+        )
 
     log(f"  dropcatch({kind}): downloading {file_url[:80]}")
     fr = requests.get(file_url, headers={"User-Agent": UA}, timeout=(20, 300))
@@ -159,11 +163,15 @@ def _dropcatch(kind: str, log=print) -> Iterator[Dict[str, Any]]:
             for _ in range(skip):
                 text.readline()
             for row in csv.DictReader(text):
+                # Confirmed columns: Domain,TLD,Type,{Drop Date|Auction End}.
+                # Neither file carries a price.
                 end = (row.get("Drop Date") if kind == "pending_delete"
                        else row.get("Auction End")) or _today()
-                yield _row(row.get("Domain Name") or row.get("Domain"),
-                           row.get("Price") or row.get("Current Bid"),
-                           str(end).split()[0], provider, domain_type)
+                domain = row.get("Domain") or row.get("Domain Name")
+                if not domain:
+                    continue
+                yield _row(domain, None, str(end).split()[0],
+                           provider, domain_type)
 
 
 def fetch_dropcatch_pending_delete(log=print):
