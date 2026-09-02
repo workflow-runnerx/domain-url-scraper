@@ -25,6 +25,11 @@ on:
         type: choice
         options:
           - namejet
+          - namecheap
+          - sedo
+          - godaddy
+          - dropcatch_pending_delete
+          - dropcatch_auctions
 
 env:
   DISPLAY: ':99'

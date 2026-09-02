@@ -27,7 +27,9 @@ evolve independently.
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import re
 import os
 import shutil
 import socket
@@ -35,20 +37,30 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 import websocket
 
+from feed_providers import PARSERS
+
 # Markers that mean Cloudflare served an interstitial instead of the real page.
 CHALLENGE_MARKERS = ("just a moment", "challenge-platform", "cf_chl_opt", "cf-mitigated")
 
+# NameJet is the only provider Cloudflare currently challenges, so it is the
+# only one that needs the browser. Everything else is a plain HTTP parser in
+# feed_providers.py — but all of them are fetched here, on a runner, so there is
+# one mechanism rather than two.
 PROVIDERS: Dict[str, Dict[str, str]] = {
     "namejet": {
         "warmup_url": "https://www.namejet.com/",
         "feed_url": "https://www.namejet.com/file_dl.sn?file=alist.csv",
     },
 }
+
+# Rows per upload batch. Namecheap is ~1.2M rows, far past what one request
+# will carry, so every provider uploads in batches for consistency.
+CHUNK_ROWS = int(os.getenv("FEED_CHUNK_ROWS", "25000"))
 
 
 def log(msg: str) -> None:
@@ -248,6 +260,96 @@ def download_feed_in_browser(chrome: Chrome, feed_url: str) -> str:
     return body
 
 
+def parse_namejet_csv(body: str) -> List[Dict[str, Any]]:
+    """Parse the NameJet alist CSV into the shared row shape.
+
+    The feed opens with a notice line and a blank line before the real header,
+    so the header row is located rather than assumed.
+    """
+    import csv as _csv
+    from datetime import datetime as _dt
+
+    lines = body.splitlines()
+    header = next(
+        (i for i, ln in enumerate(lines) if ln.strip().lower().startswith("domain name")),
+        None,
+    )
+    if header is None:
+        raise RuntimeError("namejet: header row 'Domain name,...' not found")
+
+    today = _dt.now(timezone.utc).strftime("%Y-%m-%d")
+    out: List[Dict[str, Any]] = []
+    for r in _csv.DictReader(io.StringIO("\n".join(lines[header:]))):
+        r = {(k or "").strip(): v for k, v in r.items()}
+        name = (r.get("Domain name") or "").strip()
+        if not name:
+            continue
+        try:
+            end = _dt.strptime(
+                (r.get("Auction end date") or "").strip(), "%m/%d/%Y"
+            ).strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            end = today
+        price = re.sub(r"[^\d.,]+", "", str(r.get("Current bid", "")))
+        out.append({
+            "add_date": today,
+            "domain_name": name,
+            "domain_type": "AUCTION",
+            "price": price,
+            "end_date": end,
+            "provider": "Namejet",
+            "status": "INITIATE",
+        })
+    return out
+
+
+def push_rows(api_url: str, token: str, provider: str,
+              rows: Iterable[Dict[str, Any]], source_url: str) -> Dict[str, Any]:
+    """Upload parsed rows in batches, assembling server-side on the last one.
+
+    Streaming-friendly: rows are consumed lazily so a 1.2M-row feed never has to
+    exist in memory all at once.
+    """
+    url = f"{api_url.rstrip('/')}/provider-feed/{provider}/rows/"
+    session_id = f"{provider}-{int(time.time())}"
+    headers = {"X-Feed-Token": token, "Content-Type": "application/json"}
+
+    batch: List[Dict[str, Any]] = []
+    seq = 0
+    total = 0
+    last: Dict[str, Any] = {}
+
+    def send(payload_rows, is_final):
+        nonlocal seq, total
+        body = {
+            "session_id": session_id,
+            "seq": seq,
+            "rows": payload_rows,
+            "final": is_final,
+            "source_url": source_url,
+        }
+        resp = requests.post(url, json=body, headers=headers, timeout=300)
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"chunk {seq} rejected: HTTP {resp.status_code} {resp.text[:300]}"
+            )
+        total += len(payload_rows)
+        seq += 1
+        log(f"  uploaded chunk {seq} ({len(payload_rows)} rows, {total} total)")
+        return resp.json().get("data", {})
+
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= CHUNK_ROWS:
+            send(batch, False)
+            batch = []
+
+    # The final call always fires, even with an empty tail, so the server knows
+    # the upload is complete and can assemble.
+    last = send(batch, True)
+    return last
+
+
 def push_feed(api_url: str, token: str, provider: str, body: str,
               source_url: str) -> Dict[str, Any]:
     url = f"{api_url.rstrip('/')}/provider-feed/{provider}/"
@@ -266,7 +368,8 @@ def push_feed(api_url: str, token: str, provider: str, body: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch a provider auction feed and push it")
-    ap.add_argument("--provider", default="namejet", choices=sorted(PROVIDERS))
+    ap.add_argument("--provider", default="namejet",
+                    choices=sorted(set(PROVIDERS) | set(PARSERS)))
     ap.add_argument(
         "--api-url",
         default=os.getenv(
@@ -285,20 +388,30 @@ def main() -> int:
         log("FATAL: no feed token (pass --token or set FEED_TOKEN)")
         return 2
 
-    spec = PROVIDERS[args.provider]
     last_error: Optional[Exception] = None
 
     for attempt in range(1, args.attempts + 1):
         log(f"=== {args.provider}: attempt {attempt}/{args.attempts}")
         try:
-            with Chrome(args.chrome, args.extension) as chrome:
-                clear_challenge(chrome, spec["warmup_url"], args.challenge_timeout)
-                # Logged for diagnosis: cf_clearance present means the
-                # challenge really cleared, which is the hard part.
-                harvest_cookies(chrome)
-                body = download_feed_in_browser(chrome, spec["feed_url"])
-            out = push_feed(args.api_url, args.token, args.provider, body, spec["feed_url"])
-            log(f"✅ stored: {json.dumps(out.get('data', out))}")
+            if args.provider in PROVIDERS:
+                # Cloudflare-challenged: needs the browser.
+                spec = PROVIDERS[args.provider]
+                with Chrome(args.chrome, args.extension) as chrome:
+                    clear_challenge(chrome, spec["warmup_url"], args.challenge_timeout)
+                    # Logged for diagnosis: cf_clearance present means the
+                    # challenge really cleared, which is the hard part.
+                    harvest_cookies(chrome)
+                    body = download_feed_in_browser(chrome, spec["feed_url"])
+                rows = parse_namejet_csv(body)
+                log(f"  parsed {len(rows)} rows")
+                source = spec["feed_url"]
+            else:
+                # Plain HTTP: streamed, so a 190 MB feed never lands in memory.
+                rows = PARSERS[args.provider](log)
+                source = args.provider
+
+            out = push_rows(args.api_url, args.token, args.provider, rows, source)
+            log(f"✅ stored: {json.dumps(out)}")
             return 0
         except Exception as e:  # noqa: BLE001
             last_error = e
