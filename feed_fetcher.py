@@ -267,7 +267,7 @@ def parse_namejet_csv(body: str) -> List[Dict[str, Any]]:
     so the header row is located rather than assumed.
     """
     import csv as _csv
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timezone
 
     lines = body.splitlines()
     header = next(
